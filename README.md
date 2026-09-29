@@ -1,66 +1,62 @@
-# project-ke-liye-bluprint-
-# ROLE & MISSION
-You are the Lead Systems Developer building a Windows desktop application called **"CloudPool USB"** (Unified Multi-Account Cloud Virtual Drive). 
-I am working with a Chief Architect who designed the Master Blueprint below. Your job is to strictly follow this blueprint, build the project phase-by-phase, test your code on my Windows machine, and output an **ARCHITECT STATUS REPORT** at the end of every phase so my Architect can review your work.
+# ARCHITECT REVIEW OF PHASE 1 & INSTRUCTIONS FOR PHASE 2
+
+Great job on Phase 1! All 8 tests passed and the foundation (`database.py`, `virtual_drive.py`, `controller.py`) is clean.
+
+However, my Chief Architect reviewed your **ARCHITECT STATUS REPORT** and flagged a critical architectural requirement before we proceed:
+- In Phase 1, you used `subst Z:` pointing to a materialized local staging folder. While `subst` is fine as a last-resort fallback, a plain local folder CANNOT intercept `open()` / `read(offset, length)` calls for un-downloaded cloud files! If we materialize real files into staging, it wastes local disk space and internet data; if we write 0-byte placeholders into a plain folder, double-clicking them opens an empty 0-byte file.
 
 ---
 
-# MASTER BLUEPRINT (SAVE THIS TO `BLUEPRINT.md`)
+# YOUR TASK NOW: EXECUTE PHASE 2 (ON-DEMAND STREAMING VFS + GOOGLE DRIVE MULTI-ACCOUNT + 10KB MICRO-THUMBNAILS)
 
-## 1. Core Vision
-Turn multiple free cloud storage accounts (multiple JioCloud SIM accounts + multiple Google Drive / Gemini Pro accounts) into a **single unified Virtual USB Drive (`Z:\ CloudPool`)** inside Windows File Explorer (`This PC`).
+Update `PROGRESS.md` and implement **Phase 2** with the following 4 core modules:
 
-## 2. Non-Negotiable Architecture Rules
-1. **Master ON/OFF Switch & Zero Idle Load:**
-   - Must have a lightweight Taskbar/System Tray or Mini-Controller with a Master **ON / OFF** switch.
-   - **When OFF:** The virtual drive `Z:\` completely unmounts and disappears from `This PC`. Background CPU/RAM usage must drop to **0%** and network usage to **0 KB/s**.
-   - **When ON:** Mounts `Z:\ CloudPool` within 2 seconds.
-2. **Strict Data-Saver Shield (For Limited Daily Internet):**
-   - **NO Auto-Sync / NO Full Local Mirroring:** Opening the drive or folders must ONLY fetch file metadata (names, sizes, folder tree) from the local SQLite index.
-   - **Direct Cloud Streaming (0% Local Storage Waste):** Files must NOT be permanently downloaded to local storage just to view them. Opening a file streams the required bytes directly on-demand (like watching a stream or reading from a USB drive).
-3. **Smart Micro-Thumbnail Engine (Name + Photo Preview Without Full Download):**
-   - Users must see image/video thumbnails inside File Explorer without Windows downloading full 10MB–500MB files.
-   - **How:** Intercept thumbnail/preview requests or use Windows Shell Thumbnail Handler / Cloud Thumbnail APIs to fetch ONLY tiny **5KB–15KB micro-thumbnails** and cache those tiny previews locally in SQLite/disk.
-   - When uploading files from PC, generate a 10KB micro-thumbnail locally before uploading so previewing costs **0 KB** of internet.
-4. **Server-Grade Storage Pool & 50MB Block Chunking:**
-   - A local **SQLite Master Index** tracks all connected accounts, free space per account, virtual directory trees, and file-to-account mappings.
-   - **Small Files (< 50 MB):** Stored whole on a single account (ensuring existing photos/videos already in Google Drive or JioCloud appear natively in the drive).
-   - **Large Files (>= 50 MB):** Split into **50 MB chunks** (`Part_1`, `Part_2`, etc.) distributed across multiple accounts if needed, with **resumable upload/download** support so interrupted transfers never waste mobile data.
-5. **Fast Temp Write Cache + Real-Time Upload Meter:**
-   - Copying a file into `Z:\` writes instantly to a local temporary staging folder, then uploads in the background and auto-deletes the temp file once 100% uploaded.
-   - The Mini-Controller must display **Real-Time Upload Progress**: Files in queue, exact percentage (`%`), MB uploaded / Total MB, Live Speed (`MB/s`), and a **Pause/Resume** button.
+## 1. True On-Demand Streaming VFS Engine (`cloudpool/streaming_vfs.py` + `virtual_drive.py` upgrade)
+To ensure **0% local disk waste** and **Direct Cloud Streaming** on both Windows (`Z:\`) and your Linux test environment:
+- Build a **Streaming Virtual File System Engine** with two adapters:
+  1. **Built-in Local Loopback WebDAV Server (`127.0.0.1:<port>`)** using pure Python (`http.server` / WSGI):
+     - Handles `OPTIONS`, `PROPFIND` (serves directory listings and exact file sizes directly from SQLite `nodes` — **0 KB cloud traffic**), `GET` with `Range: bytes=start-end` support (streams only the requested byte range directly from the cloud provider or staging cache in memory without saving the whole file to disk!), `PUT` (writes incoming files to staging cache + adds to `upload_queue`), `MKCOL`, `DELETE`, and `MOVE`.
+     - On Windows, when `WinFsp` is not installed, mount this local loopback WebDAV server to `Z:` using `net use Z: http://127.0.0.1:<port>/CloudPool /persistent:no` (and fall back to `subst` only if WebDAV service is disabled).
+  2. **WinFsp / FUSE Operations Adapter**:
+     - Wire `read(path, size, offset)` and `readdir(path)` to the exact same streaming core so if `winfspy` / `fusepy` is active, it streams byte ranges directly from memory/cloud.
+- **Strict Zero-Idle Guarantee:** When toggled **OFF**, the loopback server / FUSE mount and all threads must shut down completely (0 open sockets, 0 threads, 0% CPU).
 
----
+## 2. Multi-Account Cloud Provider Engine + Google Drive Connector (`cloudpool/providers/`)
+- Create `cloudpool/providers/base.py` defining the `CloudProvider` interface:
+  - `get_quota() -> dict(total_bytes, used_bytes, free_bytes)`
+  - `list_remote_nodes() -> list[RemoteNode]` (fetches metadata only: file name, size, mime_type, remote_id, thumbnail_link)
+  - `read_range(remote_id: str, offset: int, length: int) -> bytes` (streams exact byte slices using HTTP `Range` headers)
+  - `upload_file(local_path: Path, remote_parent_id: str, progress_cb) -> str`
+  - `fetch_micro_thumbnail(remote_id: str) -> Optional[bytes]` (fetches tiny 5KB–15KB thumbnail preview)
+- Create `cloudpool/providers/gdrive.py` (`GoogleDriveProvider`):
+  - Supports connecting **multiple Google Drive / Gemini Pro accounts** simultaneously. Each account stores its isolated OAuth2 credentials/refresh token in the SQLite `accounts` table.
+  - Uses Google Drive REST API v3 (`files.list` with `fields="files(id,name,mimeType,size,parents,thumbnailLink)"`, `alt=media` with `Range` header for streaming reads, and resumable upload support).
+- Create `cloudpool/providers/mock_cloud.py` (`SimulatedCloudProvider`):
+  - So we can test multi-account pooling and streaming 100% offline/in-container right now, build a realistic simulated cloud provider that can spawn multiple virtual accounts (e.g., `GoogleDrive_Account_1 (100 GB)` and `JioCloud_SIM_1 (50 GB)`) pre-loaded with sample remote photos (valid tiny JPEG/PNG images), text docs, and video files stored in a simulated remote server directory outside the local staging cache.
 
-# YOUR TASK RIGHT NOW: EXECUTE PHASE 1 (FOUNDATION & VIRTUAL USB ENGINE)
+## 3. Smart Micro-Thumbnail Engine (`cloudpool/thumbnails.py`)
+- **Rule:** Never download a full 10MB photo just to show its preview!
+- Build `ThumbnailEngine`:
+  - Stores and retrieves tiny **5KB–15KB micro-thumbnails** in the SQLite `thumbnails` table (`node_id`, `mime_type`, `data BLOB`, `width`, `height`, `updated_at`).
+  - **For Local Uploads:** Before uploading an image from staging to the cloud, automatically generate a compressed micro-thumbnail (max `160x160` or `< 15 KB`) locally so previewing it later costs **0 KB of internet**.
+  - **For Cloud Files:** Fetch the provider's tiny thumbnail endpoint (`thumbnailLink` / micro-preview) only once on demand and cache it in SQLite `thumbnails`. Second view = **0 KB internet**.
+  - Expose a fast local thumbnail preview endpoint and integrate a **"Visual Drive Browser (Name + Photo Preview)"** panel inside `controller.py` so the user can also view folder contents with instant photo thumbnails right inside the Mini-Controller or File Explorer without downloading full files!
 
-Do NOT build the whole app at once. Right now, execute **ONLY Phase 1**:
-
-1. **Initialize Project & Memory Files:**
-   - Create `BLUEPRINT.md` containing the full architecture above.
-   - Create `PROGRESS.md` tracking our 4 Phases:
-     - Phase 1: Base Virtual USB Drive (`Z:\`) + Master ON/OFF Controller + Local SQLite Metadata Index.
-     - Phase 2: Google Drive Multi-Account Connector + On-Demand Streaming + Micro-Thumbnails.
-     - Phase 3: JioCloud Multi-Account Connector + 50MB Server Chunking & Storage Pooling.
-     - Phase 4: Real-Time Upload Queue, Speed Meter, Pause/Resume & Final Polish.
-2. **Check Environment & Dependencies (Windows):**
-   - Check Python version and virtual environment.
-   - Check if **WinFsp** (Windows File System Proxy) is installed on this PC (required to mount a real Virtual Drive in `This PC`). If not installed, install it via `winget install WinFsp.WinFsp` or set up the cleanest reliable Windows Virtual Drive mount method (`winfsp` / `refuse` / `fusepy` or local WebDAV-to-Drive mount fallback if WinFsp requires reboot).
-3. **Build Phase 1 Working Prototype:**
-   - Build the **SQLite Master Index** (`database.py`) for virtual files/folders and storage pool stats.
-   - Build the **Virtual Drive Engine** (`virtual_drive.py`) that mounts `Z:\` (labeled `CloudPool`) in Windows File Explorer and serves a test directory structure from the SQLite index + staging cache so I can actually see `Z:\` in `This PC`, open it, and test creating/viewing a test file.
-   - Build the **Mini-Controller GUI / Tray Toggle** (`controller.py`) with:
-     - A big **DRIVE ON / OFF** toggle button.
-     - Status indicator (`Mounted at Z:\` vs `Offline - 0% Load`).
-     - Placeholder UI for the Live Upload Meter (`0 of 0 Files | 0.0 MB/s`) and Storage Pool bar.
-4. **Verify & Run:**
-   - Test the code, fix any errors, and make sure the Mini-Controller launches and mounts/unmounts `Z:\` cleanly.
+## 4. Upgrade Mini-Controller GUI & CLI (`cloudpool/controller.py`)
+- Add Multi-Account Management to the GUI & CLI:
+  - `--add-demo-accounts` CLI flag and GUI button to attach test multi-accounts (`Gemini Pro 100GB` + `JioCloud SIM 50GB` = `150 GB Unified Pool`) and sync their metadata tree (`0 KB` file downloads, only metadata + micro-thumbnails).
+  - `--add-gdrive` CLI/GUI hook for adding real Google Drive OAuth accounts.
+  - Show combined **Unified Storage Pool Bar** (e.g., `Pool: 150.0 GB Total | 2 Accounts Connected`).
+  - Add a compact **Visual Preview / Thumbnail Inspector** in the controller showing file names + their cached micro-thumbnails (`KB` size badge) to prove full files are NOT downloaded.
 
 ---
 
-# REQUIRED OUTPUT FORMAT (ARCHITECT STATUS REPORT)
-When you finish Phase 1, provide a concise **ARCHITECT STATUS REPORT** at the end of your response with:
-1. **Environment Check:** Python version, WinFsp status, and mount mechanism used.
-2. **Files Created:** List of files and their exact purpose.
-3. **What Works Right Now:** How `Z:\` mounts/unmounts and what passed testing.
-4. **Any Blockers/Warnings:** Anything my Architect needs to know before Phase 2.
+# VERIFICATION & ARCHITECT STATUS REPORT (PHASE 2)
+Write comprehensive tests in `tests/test_phase2.py` verifying:
+1. Connecting multiple accounts combines their storage quotas into one unified pool in SQLite.
+2. Syncing account metadata populates the virtual directory tree WITHOUT downloading the actual files to staging.
+3. Reading/opening a remote file via the Streaming VFS (`PROPFIND` + `GET` with `Range` header or VFS `read()`) streams the exact file bytes directly from the cloud provider with **0 permanent local disk footprint**.
+4. Micro-thumbnails (`< 15 KB`) are fetched/generated and cached in SQLite, and second access uses **0 bytes** of cloud network traffic.
+5. Turning the drive **OFF** stops the streaming server/mount and returns to `idle = True` (0 sockets, 0 threads).
+
+Run the full test suite (`test_phase1.py` + `test_phase2.py`) and output the **ARCHITECT STATUS REPORT — Phase 2**.
